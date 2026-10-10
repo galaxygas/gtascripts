@@ -773,7 +773,12 @@ class ScriptEngine
             ScoAnalysis a = Analyze(ti.Hash, codeAddr, bytes);
             Log.Write("script " + ti.Name + " id " + ti.Id + (ti.OnMission ? " on-mission" : "") + ": " + a.Summary);
             if (a.Error != null) { lastWhy = ti.Name + ": " + a.Error; continue; }
-            if (a.Pass == null) { lastWhy = ti.Name + " has no pass function (" + a.PickNote + ")"; continue; }
+            if (a.Pass == null)
+            {
+                lastWhy = ti.Name + " has no pass function (" + a.PickNote + ")";
+                Log.Write("diagnostics for " + ti.Name + ":\r\n" + a.Diagnose());
+                continue;
+            }
             MissionTarget m = new MissionTarget();
             m.Thread = ti.Address;
             m.Id = ti.Id;
@@ -906,6 +911,7 @@ class ScoFunction
     public int CallSites;
     public bool CalledByMain;
     public bool Bad;
+    public string BadWhy;
     public bool HasAnchor;
     public bool HasTerminate;
     public bool ReachesAnchor;
@@ -1073,7 +1079,7 @@ class ScoAnalysis
                 if (op == OP_J || op == OP_JZ || op == OP_JNZ)
                 {
                     uint t = U32(Code, at + 1);
-                    if (t >= n || !isStart[t] || t < fn.Entry || t >= fn.End) fn.Bad = true;
+                    if (t >= n || !isStart[t] || t < fn.Entry || t >= fn.End) MarkBad(fn, "jump at 0x" + at.ToString("X") + " to 0x" + t.ToString("X"));
                 }
                 else if (op == OP_SWITCH)
                 {
@@ -1081,7 +1087,7 @@ class ScoAnalysis
                     for (int c = 0; c < cnt; c++)
                     {
                         uint t = U32(Code, at + 2 + (uint)c * 8 + 4);
-                        if (t >= n || !isStart[t] || t < fn.Entry || t >= fn.End) fn.Bad = true;
+                        if (t >= n || !isStart[t] || t < fn.Entry || t >= fn.End) MarkBad(fn, "switch at 0x" + at.ToString("X") + " to 0x" + t.ToString("X"));
                     }
                 }
                 else if (op == OP_CALL)
@@ -1101,7 +1107,7 @@ class ScoAnalysis
                 }
                 else if (op == OP_ENTER && k != 0)
                 {
-                    fn.Bad = true;
+                    MarkBad(fn, "ENTER inside function at 0x" + at.ToString("X"));
                 }
                 else if (op == OP_STORE && k >= 1)
                 {
@@ -1165,6 +1171,138 @@ class ScoAnalysis
         Summary = Functions.Count + " functions, anchor " + (anchorIsRegister ? "REGISTER_MISSION_PASSED" : "PLAYSTATS_MISSION_PASSED") +
                   ", " + unc + " pass candidates, " + nr + " never return, " + PickNote;
         return null;
+    }
+
+    static void MarkBad(ScoFunction fn, string why)
+    {
+        if (!fn.Bad) fn.BadWhy = why;
+        fn.Bad = true;
+    }
+
+    static readonly string[] OpNames = {
+        "NOP", "IADD", "ISUB", "IMUL", "IDIV", "IMOD", "INOT", "INEG", "IEQ", "INE", "IGT", "IGE", "ILT", "ILE",
+        "FADD", "FSUB", "FMUL", "FDIV", "FMOD", "FNEG", "FEQ", "FNE", "FGT", "FGE", "FLT", "FLE",
+        "VADD", "VSUB", "VMUL", "VDIV", "VNEG", "IAND", "IOR", "IXOR", "J", "JZ", "JNZ", "I2F", "F2I", "F2V",
+        "PUSH_S16", "PUSH_U32", "PUSH_F", "DUP", "DROP", "NATIVE", "CALL", "ENTER", "LEAVE", "LOAD", "STORE",
+        "STORE_REV", "ARRAY_LOAD", "ARRAY_STORE", "LOCAL_0", "LOCAL_1", "LOCAL_2", "LOCAL_3", "LOCAL_4", "LOCAL_5",
+        "LOCAL_6", "LOCAL_7", "LOCAL", "STATIC", "GLOBAL", "ARRAY", "SWITCH", "STRING", "NULL", "TL_ASSIGN_S",
+        "TL_ASSIGN_I", "TL_APPEND_S", "TL_APPEND_I", "CATCH", "THROW", "TL_COPY", "GETXPROTECT", "SETXPROTECT",
+        "REFXPROTECT", "EXIT" };
+
+    string Insn(uint at)
+    {
+        byte op = Code[at];
+        string name = op < OpNames.Length ? OpNames[op] : "PUSH " + (op - 96);
+        switch (op)
+        {
+            case OP_J: case OP_JZ: case OP_JNZ: case OP_CALL: case OP_PUSH_U32: return name + " 0x" + U32(Code, at + 1).ToString("X");
+            case OP_NATIVE: return name + " " + Code[at + 1] + "/" + Code[at + 2] + " 0x" + U32(Code, at + 3).ToString("X8");
+            case OP_ENTER: return name + " " + Code[at + 1] + " " + BitConverter.ToUInt16(Code, (int)at + 2);
+            case OP_LEAVE: return name + " " + Code[at + 1] + " " + Code[at + 2];
+            case OP_SWITCH: return name + " x" + Code[at + 1];
+            case OP_STRING: return name + " len " + Code[at + 1];
+            case OP_PUSH_S16: return name + " " + BitConverter.ToInt16(Code, (int)at + 1);
+        }
+        return name;
+    }
+
+    // First instruction on a path from the entry that leaves without reaching the anchor.
+    string FirstEscape(ScoFunction fn)
+    {
+        if (fn.Insns.Count < 2) return "empty";
+        Dictionary<uint, bool> seen = new Dictionary<uint, bool>();
+        Stack<uint> work = new Stack<uint>();
+        List<uint> succ = new List<uint>();
+        work.Push(fn.Insns[1]);
+        while (work.Count > 0)
+        {
+            uint at = work.Pop();
+            if (seen.ContainsKey(at)) continue;
+            seen[at] = true;
+            byte op = Code[at];
+            if (op == OP_NATIVE && IsAnchorNative(U32(Code, at + 3))) continue;
+            if (op == OP_CALL && CallReachesAnchor(byEntry[U32(Code, at + 1)])) continue;
+            bool ret, term;
+            Successors(fn, at, succ, out ret, out term);
+            if (ret || term) return "0x" + at.ToString("X") + " " + Insn(at) + (ret ? " (return)" : " (end)");
+            for (int i = 0; i < succ.Count; i++) work.Push(succ[i]);
+        }
+        return "none";
+    }
+
+    // Written to the log when no pass function is found, so the cause can be read off.
+    public string Diagnose()
+    {
+        StringBuilder sb = new StringBuilder();
+        Dictionary<uint, int> ops = new Dictionary<uint, int>();
+        int nat = 0, wH = 0, wh = 0, tH = 0, th = 0, rH = 0, rh = 0, pH = 0, ph = 0;
+        for (int f = 0; f < Functions.Count; f++)
+            for (int k = 0; k < Functions[f].Insns.Count; k++)
+            {
+                uint at = Functions[f].Insns[k];
+                if (Code[at] != OP_NATIVE) continue;
+                nat++;
+                uint v = U32(Code, at + 3);
+                int c; ops.TryGetValue(v, out c); ops[v] = c + 1;
+                if (v == natives.WaitHandler) wH++; else if (natives.IsWait(v)) wh++;
+                if (v == natives.TerminateHandler) tH++; else if (natives.IsTerminate(v)) th++;
+                if (v == natives.RegisterHandler) rH++; else if (natives.IsRegisterPassed(v)) rh++;
+                if (v == natives.PlaystatsHandler) pH++; else if (natives.IsPlaystatsPassed(v)) ph++;
+            }
+        sb.Append("  natives ").Append(nat).Append(", distinct ").Append(ops.Count)
+          .Append("; WAIT ").Append(wH).Append('+').Append(wh).Append(", TERMINATE ").Append(tH).Append('+').Append(th)
+          .Append(", REGISTER ").Append(rH).Append('+').Append(rh).Append(", PLAYSTATS ").Append(pH).Append('+').Append(ph)
+          .Append(" (handler+hash)\r\n");
+        List<KeyValuePair<uint, int>> top = new List<KeyValuePair<uint, int>>(ops);
+        top.Sort(delegate (KeyValuePair<uint, int> x, KeyValuePair<uint, int> y) { return y.Value.CompareTo(x.Value); });
+        sb.Append("  most used native operands:");
+        for (int i = 0; i < top.Count && i < 6; i++) sb.Append(" 0x").Append(top[i].Key.ToString("X8")).Append('x').Append(top[i].Value);
+        sb.Append("\r\n");
+
+        Dictionary<uint, List<uint>> callers = new Dictionary<uint, List<uint>>();
+        for (int f = 0; f < Functions.Count; f++)
+            for (int c = 0; c < Functions[f].Callees.Count; c++)
+            {
+                List<uint> l;
+                if (!callers.TryGetValue(Functions[f].Callees[c], out l)) { l = new List<uint>(); callers[Functions[f].Callees[c]] = l; }
+                l.Add(Functions[f].Entry);
+            }
+        List<ScoFunction> chain = new List<ScoFunction>();
+        Dictionary<uint, bool> inChain = new Dictionary<uint, bool>();
+        for (int f = 0; f < Functions.Count; f++)
+            if (Functions[f].HasAnchor || Functions[f].HasTerminate) { chain.Add(Functions[f]); inChain[Functions[f].Entry] = true; }
+        for (int i = 0; i < chain.Count && chain.Count < 24; i++)
+        {
+            List<uint> l;
+            if (!chain[i].HasAnchor && !chain[i].ReachesAnchor) continue;
+            if (!callers.TryGetValue(chain[i].Entry, out l)) continue;
+            for (int c = 0; c < l.Count && chain.Count < 24; c++)
+                if (!inChain.ContainsKey(l[c])) { inChain[l[c]] = true; chain.Add(byEntry[l[c]]); }
+        }
+        for (int i = 0; i < chain.Count; i++)
+        {
+            ScoFunction fn = chain[i];
+            sb.Append("  sub_").Append(fn.Entry.ToString("X")).Append(" args ").Append(fn.ArgCount).Append(" frame ").Append(fn.FrameSize)
+              .Append(" insns ").Append(fn.Insns.Count)
+              .Append(fn.HasAnchor ? " ANCHOR" : "").Append(fn.HasTerminate ? " TERMINATE" : "")
+              .Append(fn.ReachesAnchor ? " reaches" : "").Append(fn.Unconditional ? " always" : "").Append(fn.NoReturn ? " noreturn" : "")
+              .Append(fn.Bad ? " BAD(" + fn.BadWhy + ")" : "");
+            List<uint> l;
+            if (callers.TryGetValue(fn.Entry, out l))
+            {
+                sb.Append(" callers");
+                for (int c = 0; c < l.Count && c < 6; c++) sb.Append(" sub_").Append(l[c].ToString("X"));
+            }
+            if (!fn.Bad && fn.ReachesAnchor && !fn.Unconditional) sb.Append(" escape ").Append(FirstEscape(fn));
+            sb.Append("\r\n");
+            if (i < 4)
+            {
+                sb.Append("    ");
+                for (int k = 0; k < fn.Insns.Count && k < 20; k++) sb.Append(Insn(fn.Insns[k])).Append(" | ");
+                sb.Append("\r\n");
+            }
+        }
+        return sb.ToString();
     }
 
     void Successors(ScoFunction fn, uint at, List<uint> outList, out bool returns, out bool terminal)
