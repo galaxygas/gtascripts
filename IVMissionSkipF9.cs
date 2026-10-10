@@ -31,7 +31,10 @@
 //   The thread list, program table and native table are found by structure: the static
 //   objects in the game executable are validated against live threads (script name hashes
 //   to the program hash) and against known native hashes, so no per-version addresses are
-//   used. The mission thread's code is disassembled and its functions are analysed:
+//   used. The mission thread's code is disassembled and its functions are analysed. A
+//   function is the code reachable from its ENTER: Rockstar's compiler places pieces of a
+//   function behind other functions and jumps there, and leaves unreachable bytes after
+//   LEAVEs, so functions are not byte ranges.
 //     anchor   REGISTER_MISSION_PASSED (story/strand missions) or, when a script has none,
 //              PLAYSTATS_MISSION_PASSED (random character missions).
 //     pass     a function with no parameters on which every path reaches the anchor: the
@@ -903,7 +906,6 @@ class NativeIds
 class ScoFunction
 {
     public uint Entry;
-    public uint End;
     public int ArgCount;
     public int FrameSize;
     public List<uint> Insns = new List<uint>();
@@ -1010,18 +1012,71 @@ class ScoAnalysis
         return pc >= 7 && pc < Code.Length && isStart[pc] && IsWaitAt(pc - 7);
     }
 
-    ScoFunction FunctionAt(uint pc)
+    // Functions an instruction belongs to. Rockstar's compiler places pieces of a function
+    // after other functions and jumps there (cia4's cleanup ends behind sub_3090), so a
+    // function is the code reachable from its ENTER, not a byte range (as in scrDbg).
+    Dictionary<uint, List<ScoFunction>> owners = new Dictionary<uint, List<ScoFunction>>();
+    static readonly List<ScoFunction> NoFunctions = new List<ScoFunction>();
+
+    List<ScoFunction> FunctionsAt(uint pc)
     {
-        int lo = 0, hi = Functions.Count - 1;
-        while (lo <= hi)
+        List<ScoFunction> l;
+        return owners.TryGetValue(pc, out l) ? l : NoFunctions;
+    }
+
+    void Collect(ScoFunction fn)
+    {
+        uint n = (uint)Code.Length;
+        Dictionary<uint, bool> seen = new Dictionary<uint, bool>();
+        Stack<uint> work = new Stack<uint>();
+        fn.Insns.Add(fn.Entry);
+        AddOwner(fn.Entry, fn);
+        work.Push(fn.Entry + 4);
+        while (work.Count > 0)
         {
-            int mid = (lo + hi) / 2;
-            ScoFunction f = Functions[mid];
-            if (pc < f.Entry) hi = mid - 1;
-            else if (pc >= f.End) lo = mid + 1;
-            else return f;
+            uint at = work.Pop();
+            if (seen.ContainsKey(at)) continue;
+            seen[at] = true;
+            if (at >= n || !isStart[at]) { MarkBad(fn, "flow to 0x" + at.ToString("X") + ", not an instruction"); continue; }
+            byte op = Code[at];
+            if (op == OP_ENTER) { MarkBad(fn, "flow runs into sub_" + at.ToString("X")); continue; }
+            fn.Insns.Add(at);
+            AddOwner(at, fn);
+            uint next = at + (uint)InsnSize(Code, at);
+            switch (op)
+            {
+                case OP_J:
+                    work.Push(U32(Code, at + 1));
+                    break;
+                case OP_JZ:
+                case OP_JNZ:
+                    work.Push(U32(Code, at + 1));
+                    work.Push(next);
+                    break;
+                case OP_SWITCH:
+                    {
+                        int cnt = Code[at + 1];
+                        for (int c = 0; c < cnt; c++) work.Push(U32(Code, at + 2 + (uint)c * 8 + 4));
+                        work.Push(next);
+                        break;
+                    }
+                case OP_LEAVE:
+                case OP_THROW:
+                case OP_EXIT:
+                    break;
+                default:
+                    work.Push(next);
+                    break;
+            }
         }
-        return null;
+        fn.Insns.Sort();
+    }
+
+    void AddOwner(uint at, ScoFunction fn)
+    {
+        List<ScoFunction> l;
+        if (!owners.TryGetValue(at, out l)) { l = new List<ScoFunction>(1); owners[at] = l; }
+        l.Add(fn);
     }
 
     string Build()
@@ -1030,71 +1085,56 @@ class ScoAnalysis
         isStart = new bool[n + 1];
         if (n < 4 || Code[0] != OP_ENTER) return "code does not start with ENTER";
         List<uint> all = new List<uint>();
+        int[] linear = new int[n + 1];
         uint pc = 0;
         while (pc < n)
         {
             int len = InsnSize(Code, pc);
             if (len <= 0 || pc + (uint)len > n) return "instruction overruns code at 0x" + pc.ToString("X");
             isStart[pc] = true;
+            linear[pc] = all.Count;
             all.Add(pc);
             pc += (uint)len;
         }
 
         bool sawRegister = false, sawPlaystats = false;
-        ScoFunction cur = null;
         for (int i = 0; i < all.Count; i++)
         {
             uint at = all[i];
             byte op = Code[at];
             if (op == OP_ENTER)
             {
-                if (cur != null) cur.End = at;
-                cur = new ScoFunction();
-                cur.Entry = at;
-                cur.ArgCount = Code[at + 1];
-                cur.FrameSize = BitConverter.ToUInt16(Code, (int)at + 2);
-                Functions.Add(cur);
-                byEntry[at] = cur;
+                ScoFunction fn = new ScoFunction();
+                fn.Entry = at;
+                fn.ArgCount = Code[at + 1];
+                fn.FrameSize = BitConverter.ToUInt16(Code, (int)at + 2);
+                Functions.Add(fn);
+                byEntry[at] = fn;
             }
-            cur.Insns.Add(at);
-            if (op == OP_NATIVE)
+            else if (op == OP_NATIVE)
             {
                 uint v = U32(Code, at + 3);
                 if (natives.IsRegisterPassed(v)) sawRegister = true;
                 if (natives.IsPlaystatsPassed(v)) sawPlaystats = true;
             }
         }
-        cur.End = n;
         anchorIsRegister = sawRegister;
         if (!sawRegister && !sawPlaystats) return "no REGISTER_MISSION_PASSED or PLAYSTATS_MISSION_PASSED";
+        for (int f = 0; f < Functions.Count; f++) Collect(Functions[f]);
 
         ScoFunction main = Functions[0];
         for (int f = 0; f < Functions.Count; f++)
         {
             ScoFunction fn = Functions[f];
-            for (int k = 0; k < fn.Insns.Count; k++)
+            for (int k = 1; k < fn.Insns.Count; k++)
             {
                 uint at = fn.Insns[k];
                 byte op = Code[at];
-                if (op == OP_J || op == OP_JZ || op == OP_JNZ)
-                {
-                    uint t = U32(Code, at + 1);
-                    if (t >= n || !isStart[t] || t < fn.Entry || t >= fn.End) MarkBad(fn, "jump at 0x" + at.ToString("X") + " to 0x" + t.ToString("X"));
-                }
-                else if (op == OP_SWITCH)
-                {
-                    int cnt = Code[at + 1];
-                    for (int c = 0; c < cnt; c++)
-                    {
-                        uint t = U32(Code, at + 2 + (uint)c * 8 + 4);
-                        if (t >= n || !isStart[t] || t < fn.Entry || t >= fn.End) MarkBad(fn, "switch at 0x" + at.ToString("X") + " to 0x" + t.ToString("X"));
-                    }
-                }
-                else if (op == OP_CALL)
+                if (op == OP_CALL)
                 {
                     uint t = U32(Code, at + 1);
                     ScoFunction g;
-                    if (t >= n || !byEntry.TryGetValue(t, out g)) return "CALL to a non-function at 0x" + at.ToString("X");
+                    if (t >= n || !byEntry.TryGetValue(t, out g)) { MarkBad(fn, "CALL at 0x" + at.ToString("X") + " to a non-function"); continue; }
                     if (!fn.Callees.Contains(t)) fn.Callees.Add(t);
                     g.CallSites++;
                     if (fn == main) g.CalledByMain = true;
@@ -1105,16 +1145,13 @@ class ScoAnalysis
                     if (IsAnchorNative(v)) fn.HasAnchor = true;
                     if (natives.IsTerminate(v)) fn.HasTerminate = true;
                 }
-                else if (op == OP_ENTER && k != 0)
-                {
-                    MarkBad(fn, "ENTER inside function at 0x" + at.ToString("X"));
-                }
-                else if (op == OP_STORE && k >= 1)
+                else if (op == OP_STORE)
                 {
                     // static or global written directly by this function (stage, loop flag, flow)
-                    for (int b = Math.Max(0, k - 4); b < k; b++)
+                    int li = linear[at];
+                    for (int b = Math.Max(0, li - 4); b < li; b++)
                     {
-                        byte prev = Code[fn.Insns[b]];
+                        byte prev = Code[all[b]];
                         if (prev == OP_STATIC || prev == OP_GLOBAL) fn.WritesState = true;
                     }
                 }
@@ -1213,7 +1250,7 @@ class ScoAnalysis
         Dictionary<uint, bool> seen = new Dictionary<uint, bool>();
         Stack<uint> work = new Stack<uint>();
         List<uint> succ = new List<uint>();
-        work.Push(fn.Insns[1]);
+        work.Push(fn.Entry + 4);
         while (work.Count > 0)
         {
             uint at = work.Pop();
@@ -1341,7 +1378,7 @@ class ScoAnalysis
                 if (byEntry[U32(Code, at + 1)].NoReturn) { terminal = true; return; }
                 break;
         }
-        if (next >= fn.End) { returns = true; return; }
+        if (next >= Code.Length || Code[next] == OP_ENTER) { returns = true; return; }
         outList.Add(next);
     }
 
@@ -1351,7 +1388,7 @@ class ScoAnalysis
         Dictionary<uint, bool> seen = new Dictionary<uint, bool>();
         Stack<uint> work = new Stack<uint>();
         List<uint> succ = new List<uint>();
-        work.Push(fn.Insns[1]);
+        work.Push(fn.Entry + 4);
         while (work.Count > 0)
         {
             uint at = work.Pop();
@@ -1382,7 +1419,7 @@ class ScoAnalysis
         Stack<uint> work = new Stack<uint>();
         List<uint> succ = new List<uint>();
         bool any = false;
-        work.Push(fn.Insns[1]);
+        work.Push(fn.Entry + 4);
         while (work.Count > 0)
         {
             uint at = work.Pop();
@@ -1484,25 +1521,40 @@ class ScoAnalysis
         frames = new List<ScoFunction>();
         for (int depth = 0; depth < 64; depth++)
         {
-            ScoFunction f = FunctionAt(pc);
-            if (f == null) return "pc 0x" + pc.ToString("X") + " outside code";
-            frames.Add(f);
-            ulong slot = (ulong)fp + (ulong)f.ArgCount;
-            if (slot + 1 >= sp) return "frame of sub_" + f.Entry.ToString("X") + " above sp";
-            uint retPc = BitConverter.ToUInt32(stack, (int)slot * 4);
-            uint callerFp = BitConverter.ToUInt32(stack, (int)(slot + 1) * 4);
-            if (retPc == 0)
+            List<ScoFunction> cands = FunctionsAt(pc);
+            if (cands.Count == 0) return "pc 0x" + pc.ToString("X") + " is not in any function";
+            ScoFunction f = null;
+            uint nextPc = 0, nextFp = 0;
+            string why = null;
+            for (int i = 0; i < cands.Count && f == null; i++)
             {
-                if (f.Entry != 0) return "chain ends in sub_" + f.Entry.ToString("X") + ", not main";
-                return null;
+                ScoFunction c = cands[i];
+                ulong slot = (ulong)fp + (ulong)c.ArgCount;
+                if (slot + 1 >= sp) { why = "frame of sub_" + c.Entry.ToString("X") + " above sp"; continue; }
+                uint retPc = BitConverter.ToUInt32(stack, (int)slot * 4);
+                uint callerFp = BitConverter.ToUInt32(stack, (int)(slot + 1) * 4);
+                if (retPc == 0)
+                {
+                    if (c.Entry != 0) { why = "chain ends in sub_" + c.Entry.ToString("X") + ", not main"; continue; }
+                    frames.Add(c);
+                    return null;
+                }
+                if (retPc < 5 || retPc > Code.Length) { why = "return pc 0x" + retPc.ToString("X") + " outside code"; continue; }
+                uint call = retPc - 5;
+                if (!isStart[call] || Code[call] != OP_CALL || U32(Code, call + 1) != c.Entry)
+                {
+                    why = "return pc 0x" + retPc.ToString("X") + " does not follow a CALL to sub_" + c.Entry.ToString("X");
+                    continue;
+                }
+                if (callerFp >= fp) { why = "caller fp " + callerFp + " not below fp " + fp; continue; }
+                f = c;
+                nextPc = call;
+                nextFp = callerFp;
             }
-            if (retPc < 5 || retPc > Code.Length) return "return pc 0x" + retPc.ToString("X") + " outside code";
-            uint call = retPc - 5;
-            if (!isStart[call] || Code[call] != OP_CALL || U32(Code, call + 1) != f.Entry)
-                return "return pc 0x" + retPc.ToString("X") + " does not follow a CALL to sub_" + f.Entry.ToString("X");
-            if (callerFp >= fp) return "caller fp " + callerFp + " not below fp " + fp;
-            pc = call;
-            fp = callerFp;
+            if (f == null) return why;
+            frames.Add(f);
+            pc = nextPc;
+            fp = nextFp;
         }
         return "call stack deeper than 64";
     }
