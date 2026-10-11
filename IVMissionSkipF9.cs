@@ -58,6 +58,29 @@
 //   A pass function that returns is only injected while the thread is in main(), so the
 //   mission's own main loop ends it right after.
 //
+// SAFETY
+//   The game itself already ends missions from any WAIT: when the player dies or is
+//   arrested it moves the mission thread to the point saved by HAS_DEATHARREST_EXECUTED
+//   (GtaThread m_dwSavedDeathArrestIP / FrameSP / StackOff, FusionFix comvars.ixx), and
+//   the mission then runs  if (HAS_DEATHARREST_EXECUTED()) { fail(); cleanup(); }.
+//   The skip is held to that same teardown:
+//     - Only the script the game flags as the current mission (GtaThread m_bOnMission) is
+//       touched. Trigger and contact scripts that also contain a pass (jimmysuit,
+//       romanblips) are never passed.
+//     - Every cleanup the pass function can reach must be one of the cleanups the
+//       mission's own death/arrest handler runs; missions without such a handler are
+//       refused. In all decompiled IV, TLAD and TBoGT missions with a handler this holds.
+//     - The call is only made while the player is in normal play, which is when a death or
+//       arrest can happen: player playing and in control, not being arrested, screen faded
+//       in, no widescreen borders, no cutscene playing, no mission-complete jingle. During
+//       cutscenes and scripted scenes (cameras held in function locals, player control
+//       off) the skip waits.
+//   In cia4 the injection point is the main loop's WAIT(0) that Rockstar's own debug
+//   check "if (IS_KEYBOARD_KEY_JUST_PRESSED(31 = S)) pass();" follows, and the pass ends
+//   in the same cleanup (sub_2761) the death/arrest handler calls.
+//   The mod writes only the mission thread's PC, SP, wait time, state and one stack slot,
+//   all of which exist only while the game runs; nothing else in memory is changed.
+//
 // LIMITS
 //   Missions without a pass function (side activities such as taxi, vigilante, races, dates,
 //   friend outings without a pass) are reported as not skippable. So are the few missions
@@ -65,9 +88,13 @@
 //   IV berniecar, brucie5m, finaleaorb, jimmy4a, pxdfcut, roman9; TLAD dave, elizabeta3,
 //   ray1, stubbs3m1, stubbs3m2, stubbs3m5; TBoGT brother3, e2endcredits, mum1): F9
 //   refuses there instead of registering a partial pass.
+//   Flagged scripts without a death/arrest handler are refused too; in the decompiled
+//   scripts these are only cutscene and credits scripts (IV finaleintrocut, placeholder;
+//   TLAD e1endcredits, opening_credits).
 //   While a mission is already passing, failing or cleaning up, F9 does nothing.
-//   During a long cutscene or phone call a "returning" pass waits until the mission is back
-//   in main(); the skip keeps trying for 30 seconds.
+//   During a cutscene, fade or scripted scene the skip waits for normal play, and a
+//   "returning" pass also waits until the mission is back in main(); it keeps trying for
+//   60 seconds.
 
 using System;
 using System.Collections.Generic;
@@ -80,7 +107,7 @@ using GTA;
 
 public class IVMissionSkipF9 : Script
 {
-    const int TRY_MS = 30000;
+    const int TRY_MS = 60000;
     const int PREFER_MAIN_MS = 2500;
     const int FINISH_MS = 90000;
 
@@ -189,9 +216,10 @@ public class IVMissionSkipF9 : Script
                 Log.Write("gave up: " + j.LastWhy);
                 return;
             }
-            if (!PlayerPlaying())
+            string busy = NotInNormalPlay();
+            if (busy != null)
             {
-                j.Note("player is not in control");
+                j.Note(busy);
                 return;
             }
             bool mainOnly = !j.Target.Pass.NoReturn || now - j.Started < PREFER_MAIN_MS;
@@ -231,10 +259,23 @@ public class IVMissionSkipF9 : Script
         }
     }
 
-    static bool PlayerPlaying()
+    // Null while the player is in normal play, the state in which a mission can be ended by
+    // a death or arrest; otherwise what the skip is waiting for. The natives and their
+    // arguments are the ones the mission scripts use (player = CONVERT_INT_TO_PLAYERINDEX(
+    // GET_PLAYER_ID()), the cutscene check is the scripts' HAS_CUTSCENE_LOADED /
+    // HAS_CUTSCENE_FINISHED pair).
+    static string NotInNormalPlay()
     {
         int id = GTA.Native.Function.Call<int>("GET_PLAYER_ID");
-        return GTA.Native.Function.Call<bool>("IS_PLAYER_PLAYING", id);
+        int player = GTA.Native.Function.Call<int>("CONVERT_INT_TO_PLAYERINDEX", id);
+        if (!GTA.Native.Function.Call<bool>("IS_PLAYER_PLAYING", player)) return "player is not playing";
+        if (!GTA.Native.Function.Call<bool>("IS_PLAYER_CONTROL_ON", player)) return "player control is off (cutscene or scripted scene)";
+        if (GTA.Native.Function.Call<bool>("IS_PLAYER_BEING_ARRESTED")) return "player is being arrested";
+        if (!GTA.Native.Function.Call<bool>("IS_SCREEN_FADED_IN")) return "screen is faded or fading";
+        if (GTA.Native.Function.Call<bool>("ARE_WIDESCREEN_BORDERS_ACTIVE")) return "cutscene borders are on";
+        if (GTA.Native.Function.Call<bool>("HAS_CUTSCENE_LOADED") && !GTA.Native.Function.Call<bool>("HAS_CUTSCENE_FINISHED")) return "a cutscene is playing";
+        if (GTA.Native.Function.Call<bool>("IS_MISSION_COMPLETE_PLAYING")) return "mission complete is playing";
+        return null;
     }
 
     static void Say(string msg)
@@ -421,6 +462,9 @@ class ScriptEngine
     public static readonly uint[] H_TERMINATE = { 0x2BCD1ECA, 0x245B6AB6 };
     public static readonly uint[] H_REGISTER_PASSED = { 0x5FBE5F52, 0x23E3421D };
     public static readonly uint[] H_PLAYSTATS_PASSED = { 0x437D3E19, 0xF94144F2 };
+    // HAS_DEATHARREST_EXECUTED: FusionFix natives.ixx 0x3B0C6738, SCO ToolBox HashesOld.dat
+    // 1842155866 = 0x6DCD115A (Jenkins hash of the name)
+    public static readonly uint[] H_DEATHARREST = { 0x3B0C6738, 0x6DCD115A };
 
     IMemory mem;
     uint threadsArray;
@@ -613,7 +657,8 @@ class ScriptEngine
         if (nativesTable != 0)
             Log.Write("native table at 0x" + nativesTable.ToString("X8") + ", WAIT handler 0x" + Natives.WaitHandler.ToString("X8") +
                       ", TERMINATE 0x" + Natives.TerminateHandler.ToString("X8") + ", REGISTER_MISSION_PASSED 0x" + Natives.RegisterHandler.ToString("X8") +
-                      ", PLAYSTATS_MISSION_PASSED 0x" + Natives.PlaystatsHandler.ToString("X8"));
+                      ", PLAYSTATS_MISSION_PASSED 0x" + Natives.PlaystatsHandler.ToString("X8") +
+                      ", HAS_DEATHARREST_EXECUTED 0x" + Natives.DeathArrestHandler.ToString("X8"));
         else
             Log.Write("native table not found, matching native hashes in code only");
         return null;
@@ -726,10 +771,13 @@ class ScriptEngine
             if (!HashLookupRaw(entries, size, H_TERMINATE[set], 32, out t) || !InModule(t) || t == w) continue;
             if (!HashLookupRaw(entries, size, H_REGISTER_PASSED[set], 32, out r) || !InModule(r) || r == w || r == t) continue;
             if (!HashLookupRaw(entries, size, H_PLAYSTATS_PASSED[set], 32, out s) || !InModule(s)) s = 0;
+            uint d;
+            if (!HashLookupRaw(entries, size, H_DEATHARREST[set], 32, out d) || !InModule(d)) d = 0;
             Natives.WaitHandler = w;
             Natives.TerminateHandler = t;
             Natives.RegisterHandler = r;
             Natives.PlaystatsHandler = s;
+            Natives.DeathArrestHandler = d;
             Log.Write("native hash set: " + (set == 0 ? "1.0.7.0+ / EFLC / CE" : "1.0.6.0 and older"));
             return true;
         }
@@ -764,17 +812,19 @@ class ScriptEngine
     {
         List<ThreadInfo> threads = ReadThreads();
         List<MissionTarget> found = new List<MissionTarget>();
-        List<ThreadInfo> owners = new List<ThreadInfo>();
-        string lastWhy = "no running script has a mission pass";
+        string lastWhy = "no script is flagged as the current mission";
         for (int i = 0; i < threads.Count; i++)
         {
             ThreadInfo ti = threads[i];
+            // Only the mission itself: scripts that merely contain a pass (contact and trigger
+            // scripts such as jimmysuit or romanblips) must never be passed.
+            if (!ti.OnMission) continue;
             uint codeAddr;
             byte[] bytes;
-            if (!ProgramCode(ti.Hash, out codeAddr, out bytes)) continue;
-            if (!ScoAnalysis.MayHaveAnchor(bytes, Natives)) continue;
+            if (!ProgramCode(ti.Hash, out codeAddr, out bytes)) { lastWhy = ti.Name + ": program code not found"; continue; }
+            if (!ScoAnalysis.MayHaveAnchor(bytes, Natives)) { lastWhy = ti.Name + " has no mission pass"; continue; }
             ScoAnalysis a = Analyze(ti.Hash, codeAddr, bytes);
-            Log.Write("script " + ti.Name + " id " + ti.Id + (ti.OnMission ? " on-mission" : "") + ": " + a.Summary);
+            Log.Write("script " + ti.Name + " id " + ti.Id + " on-mission: " + a.Summary);
             if (a.Error != null) { lastWhy = ti.Name + ": " + a.Error; continue; }
             if (a.Pass == null)
             {
@@ -782,6 +832,7 @@ class ScriptEngine
                 Log.Write("diagnostics for " + ti.Name + ":\r\n" + a.Diagnose());
                 continue;
             }
+            if (a.Refusal != null) { lastWhy = ti.Name + ": " + a.Refusal; continue; }
             MissionTarget m = new MissionTarget();
             m.Thread = ti.Address;
             m.Id = ti.Id;
@@ -791,25 +842,18 @@ class ScriptEngine
             m.Code = a;
             m.Pass = a.Pass;
             found.Add(m);
-            owners.Add(ti);
         }
         reason = lastWhy;
         if (found.Count == 0) return null;
-        int pick = 0;
-        for (int i = 1; i < found.Count; i++)
-        {
-            bool bm = owners[pick].OnMission, im = owners[i].OnMission;
-            if (im && !bm) pick = i;
-            else if (im == bm && owners[i].Id > owners[pick].Id) pick = i;
-        }
         if (found.Count > 1)
         {
             StringBuilder sb = new StringBuilder();
-            for (int i = 0; i < found.Count; i++) sb.Append(found[i].Name).Append(owners[i].OnMission ? "*" : "").Append(' ');
-            Log.Write("several scripts can pass: " + sb + "-> " + found[pick].Name);
+            for (int i = 0; i < found.Count; i++) sb.Append(' ').Append(found[i].Name);
+            reason = "several scripts are flagged as the current mission:" + sb;
+            return null;
         }
         reason = null;
-        return found[pick];
+        return found[0];
     }
 
     public bool ThreadIsSame(MissionTarget t)
@@ -889,7 +933,7 @@ class ScriptEngine
 
 class NativeIds
 {
-    public uint WaitHandler, TerminateHandler, RegisterHandler, PlaystatsHandler;
+    public uint WaitHandler, TerminateHandler, RegisterHandler, PlaystatsHandler, DeathArrestHandler;
 
     static bool Is(uint v, uint handler, uint[] hashes)
     {
@@ -899,6 +943,7 @@ class NativeIds
     public bool IsTerminate(uint v) { return Is(v, TerminateHandler, ScriptEngine.H_TERMINATE); }
     public bool IsRegisterPassed(uint v) { return Is(v, RegisterHandler, ScriptEngine.H_REGISTER_PASSED); }
     public bool IsPlaystatsPassed(uint v) { return Is(v, PlaystatsHandler, ScriptEngine.H_PLAYSTATS_PASSED); }
+    public bool IsDeathArrest(uint v) { return Is(v, DeathArrestHandler, ScriptEngine.H_DEATHARREST); }
 }
 
 // ------------------------------------------------------------------ SCO code analysis
@@ -937,6 +982,10 @@ class ScoAnalysis
     public string PickNote = "";
     public string Summary = "";
     public ScoFunction Pass;
+    // Why the pass must not be used (null when it may), and the cleanups the mission's
+    // death/arrest handler runs.
+    public string Refusal;
+    public List<ScoFunction> DeathCleanup = new List<ScoFunction>();
     public List<ScoFunction> Functions = new List<ScoFunction>();
     Dictionary<uint, ScoFunction> byEntry = new Dictionary<uint, ScoFunction>();
     bool[] isStart;
@@ -1201,12 +1250,19 @@ class ScoAnalysis
             Functions[f].IsPassPath = Functions[f].Unconditional || Functions[f].HasAnchor;
 
         PickPass(main);
-        if (Pass != null) Pass.StackNeed = StackNeed(Pass, new Dictionary<uint, int>(), 0);
+        if (Pass != null)
+        {
+            Pass.StackNeed = StackNeed(Pass, new Dictionary<uint, int>(), 0);
+            CheckCleanup();
+        }
 
         int nr = 0, unc = 0;
         for (int f = 0; f < Functions.Count; f++) { if (Functions[f].NoReturn) nr++; if (Functions[f].Unconditional && f > 0) unc++; }
+        StringBuilder dc = new StringBuilder();
+        for (int i = 0; i < DeathCleanup.Count; i++) dc.Append(" sub_").Append(DeathCleanup[i].Entry.ToString("X"));
         Summary = Functions.Count + " functions, anchor " + (anchorIsRegister ? "REGISTER_MISSION_PASSED" : "PLAYSTATS_MISSION_PASSED") +
-                  ", " + unc + " pass candidates, " + nr + " never return, " + PickNote;
+                  ", " + unc + " pass candidates, " + nr + " never return, " + PickNote +
+                  (DeathCleanup.Count > 0 ? ", death/arrest cleanup" + dc : "") + (Refusal != null ? ", REFUSED: " + Refusal : "");
         return null;
     }
 
@@ -1495,6 +1551,125 @@ class ScoAnalysis
             for (int i = 0; i < picks.Count; i++) if (picks[i] != best) sb.Append(" sub_").Append(picks[i].Entry.ToString("X"));
         }
         PickNote = sb.ToString();
+    }
+
+    // Functions reachable from fn through calls, fn included.
+    List<ScoFunction> Reach(ScoFunction fn)
+    {
+        List<ScoFunction> list = new List<ScoFunction>();
+        Dictionary<uint, bool> seen = new Dictionary<uint, bool>();
+        Stack<ScoFunction> work = new Stack<ScoFunction>();
+        work.Push(fn);
+        while (work.Count > 0)
+        {
+            ScoFunction f = work.Pop();
+            if (seen.ContainsKey(f.Entry)) continue;
+            seen[f.Entry] = true;
+            list.Add(f);
+            for (int i = 0; i < f.Callees.Count; i++) work.Push(byEntry[f.Callees[i]]);
+        }
+        return list;
+    }
+
+    // Calls made on the branch taken when HAS_DEATHARREST_EXECUTED() is true: from the
+    // instruction after its JZ up to the JZ target, where the branch joins the code after it.
+    void CollectBranch(uint from, uint join, List<ScoFunction> calls)
+    {
+        uint n = (uint)Code.Length;
+        Dictionary<uint, bool> seen = new Dictionary<uint, bool>();
+        Stack<uint> work = new Stack<uint>();
+        work.Push(from);
+        while (work.Count > 0 && seen.Count < 100000)
+        {
+            uint at = work.Pop();
+            if (at == join || seen.ContainsKey(at)) continue;
+            seen[at] = true;
+            if (at >= n || !isStart[at] || Code[at] == OP_ENTER) continue;
+            byte op = Code[at];
+            uint next = at + (uint)InsnSize(Code, at);
+            switch (op)
+            {
+                case OP_J:
+                    work.Push(U32(Code, at + 1));
+                    break;
+                case OP_JZ:
+                case OP_JNZ:
+                    work.Push(U32(Code, at + 1));
+                    work.Push(next);
+                    break;
+                case OP_SWITCH:
+                    {
+                        int cnt = Code[at + 1];
+                        for (int c = 0; c < cnt; c++) work.Push(U32(Code, at + 2 + (uint)c * 8 + 4));
+                        work.Push(next);
+                        break;
+                    }
+                case OP_LEAVE:
+                case OP_THROW:
+                case OP_EXIT:
+                    break;
+                case OP_CALL:
+                    {
+                        ScoFunction g;
+                        if (byEntry.TryGetValue(U32(Code, at + 1), out g) && !calls.Contains(g)) calls.Add(g);
+                        work.Push(next);
+                        break;
+                    }
+                default:
+                    if (op == OP_NATIVE && natives.IsTerminate(U32(Code, at + 3))) break;
+                    work.Push(next);
+                    break;
+            }
+        }
+    }
+
+    // The game ends a mission on death or arrest by resuming its thread where it called
+    // HAS_DEATHARREST_EXECUTED; the mission then runs its fail stats and its cleanup. The pass
+    // is only used when every cleanup (function containing TERMINATE_THIS_SCRIPT) it can reach
+    // is one of the cleanups reached from that branch, so the mission is torn down by the
+    // same code as on a death or arrest.
+    void CheckCleanup()
+    {
+        List<ScoFunction> branchCalls = new List<ScoFunction>();
+        int handlers = 0;
+        for (int f = 0; f < Functions.Count; f++)
+        {
+            ScoFunction fn = Functions[f];
+            if (fn.Bad) continue;
+            for (int k = 1; k < fn.Insns.Count; k++)
+            {
+                uint at = fn.Insns[k];
+                if (Code[at] != OP_NATIVE || Code[at + 1] != 0 || Code[at + 2] != 1 || !natives.IsDeathArrest(U32(Code, at + 3))) continue;
+                uint jz = at + 7;
+                if (jz + 5 > Code.Length || !isStart[jz] || Code[jz] != OP_JZ) continue;
+                handlers++;
+                CollectBranch(jz + 5, U32(Code, jz + 1), branchCalls);
+            }
+        }
+        if (handlers == 0) { Refusal = "the mission has no death/arrest handler, so there is no game-tested cleanup to end it with"; return; }
+
+        Dictionary<uint, bool> death = new Dictionary<uint, bool>();
+        for (int i = 0; i < branchCalls.Count; i++)
+        {
+            List<ScoFunction> r = Reach(branchCalls[i]);
+            for (int j = 0; j < r.Count; j++)
+                if (r[j].HasTerminate && !death.ContainsKey(r[j].Entry)) { death[r[j].Entry] = true; DeathCleanup.Add(r[j]); }
+        }
+        if (DeathCleanup.Count == 0) { Refusal = "the mission's death/arrest handler calls no cleanup"; return; }
+
+        List<ScoFunction> reach = Reach(Pass);
+        int ends = 0;
+        for (int i = 0; i < reach.Count; i++)
+        {
+            if (!reach[i].HasTerminate) continue;
+            if (!death.ContainsKey(reach[i].Entry))
+            {
+                Refusal = "the pass can end in sub_" + reach[i].Entry.ToString("X") + ", which is not the cleanup the game runs on death/arrest";
+                return;
+            }
+            ends++;
+        }
+        if (Pass.NoReturn && ends == 0) Refusal = "the pass ends the script without the mission's cleanup";
     }
 
     // Upper bound for the stack slots the pass needs above the current SP: per frame the
